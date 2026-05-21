@@ -8,7 +8,6 @@ from src.backend.agent_loop import AgentLoop
 class Orchestrator:
     def __init__(self, config: AgentConfig):
         self.config = config
-
         self.llm = OllamaLLM(
             host=config.ollama_host,
             model=config.model,
@@ -24,25 +23,23 @@ class Orchestrator:
             "workspace": self.config.workspace_dir,
         }
 
-    def execute_task(self, user_input: str, use_planning: bool = True) -> str:
+    def execute_task(self, user_input: str, use_planning: bool = True) -> dict:
         if not self.llm.check_available():
-            return "Error: Ollama is not running. Start it with 'ollama serve'"
+            return {"result": "Error: Ollama is not running", "events": [], "files": []}
 
         if use_planning:
             plan = self.planner.create_plan(user_input)
-
-            plan_text = f"Plan ({len(plan.steps)} steps):"
-            for i, step in enumerate(plan.steps, 1):
-                plan_text += f"\n  {i}. {step.description} [{step.tool.value}]"
-            print(plan_text)
+            plan_events = [{"type": "plan", "steps": [
+                {"description": s.description, "tool": s.tool.value} for s in plan.steps
+            ]}]
 
             plan_input = f"Goal: {user_input}\n\nPlan:\n" + "\n".join(
-                f"{i}. {s.description} (tool: {s.tool.value}, args: {s.args})"
-                for i, s in enumerate(plan.steps, 1)
+                f"{i}. {s.description}" for i, s in enumerate(plan.steps, 1)
             )
-
             loop = AgentLoop(self.llm, self.tools, self.config)
-            return loop.run(plan_input)
+            result, loop_events, files = loop.run(plan_input)
+            return {"result": result, "events": plan_events + loop_events, "files": files}
         else:
             loop = AgentLoop(self.llm, self.tools, self.config)
-            return loop.run(user_input)
+            result, events, files = loop.run(user_input)
+            return {"result": result, "events": events, "files": files}

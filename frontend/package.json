@@ -1,0 +1,16 @@
+{
+  "name": "llm-machine",
+  "version": "1.0.0",
+  "description": "OpenCode-style Local LLM IDE",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron ."
+  },
+  "dependencies": {
+    "electron": "^33.0.0",
+    "monaco-editor": "^0.52.0",
+    "diff": "^7.0.0"
+  },
+  "devDependencies": {}
+}

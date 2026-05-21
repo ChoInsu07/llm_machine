@@ -20,17 +20,61 @@ class OllamaLLM(BaseLLM):
             for m in messages
         ]
 
+    def _detect_available_model(self) -> str | None:
+        try:
+            resp = requests.get(f"{self.host}/api/tags", timeout=5)
+            if resp.status_code == 200:
+                models = resp.json().get("models", [])
+                if models:
+                    return models[0]["name"]
+        except Exception:
+            pass
+        return None
+
+    def supports_tools(self) -> bool:
+        try:
+            resp = requests.get(f"{self.host}/api/tags", timeout=5)
+            if resp.status_code == 200:
+                models = resp.json().get("models", [])
+                for m in models:
+                    if m["name"] == self.model:
+                        details = m.get("details", {})
+                        families = details.get("families", [])
+                        if not families:
+                            families = [details.get("family", "")]
+                        fam = " ".join(families).lower()
+                        if any(x in fam for x in ("llama", "qwen", "deepseek", "mistral", "mixtral", "command-r", "dbrx")):
+                            return True
+                        return False
+            return True
+        except Exception:
+            return True
+
     def chat(self, messages: list[Message], tools: list[dict] | None = None) -> Message:
         body = {
             "model": self.model,
             "messages": self._format_messages(messages),
             "stream": False,
         }
-        if tools:
-            body["tools"] = tools
 
-        resp = requests.post(self.chat_url, json=body, timeout=120)
-        resp.raise_for_status()
+        try:
+            resp = requests.post(self.chat_url, json=body, timeout=120)
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            if resp.status_code == 404:
+                available = self._detect_available_model()
+                if available:
+                    self.model = available
+                    body["model"] = available
+                    resp = requests.post(self.chat_url, json=body, timeout=120)
+                    resp.raise_for_status()
+                else:
+                    raise Exception(f"Model '{self.model}' not found. Run: ollama pull {self.model}")
+            else:
+                raise
+        except requests.ConnectionError:
+            raise Exception("Cannot connect to Ollama. Run: ollama serve")
+
         data = resp.json()
 
         msg = data.get("message", {})

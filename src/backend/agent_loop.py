@@ -1,32 +1,51 @@
+import re
+import json
 from src.models.schemas import (
-    Message, Role, Plan, PlanStep, ToolName,
-    ActionStatus, ToolResult, AgentConfig,
+    Message, Role, ToolName, ToolResult, AgentConfig,
 )
 from src.backend.interface.base import BaseLLM
 from src.backend.tools import ToolRegistry
 
 
-SYSTEM_PROMPT = """You are an autonomous coding agent. You solve problems by using tools and thinking step by step.
+TOOL_DESCRIPTIONS = """
+Available tools - call them by writing EXACTLY this format in your response:
 
-Available tools:
-- read_file: Read a file's contents
-- write_file: Create or overwrite a file
-- edit_file: Edit a file by replacing text
-- list_dir: List directory contents
-- run_command: Run a shell command
-- bash: Run a bash command (for scripts/compilation)
-- git_status: Show git status
-- git_diff: Show uncommitted changes
-- search_code: Search codebase for a pattern
-- finish: Call when the task is complete
+read_file(path="file.py", offset=0, limit=2000)
+write_file(path="file.py", content="your code here")
+edit_file(path="file.py", old_string="old", new_string="new")
+run_command(command="pytest tests/")
+bash(command="python script.py")
+git_status()
+git_diff()
+search_code(pattern="TODO", include="*.py")
+list_dir(path=".")
+finish(summary="What was done")
 
-Guidelines:
-1. First understand the problem by reading relevant files
-2. Make a plan before writing code
-3. Test your changes by running commands
-4. If something fails, diagnose and fix it
-5. Call finish when done with a summary
-6. Keep your responses concise and focused on actions"""
+You MUST use these tools to read, write, and execute code.
+Always use write_file to create files, run_command to test, finish when done.
+"""
+
+TOOL_PATTERN = re.compile(
+    r'(read_file|write_file|edit_file|run_command|bash|git_status|git_diff|search_code|list_dir|finish)'
+    r'\s*\(\s*((?:[^)]*?))\s*\)',
+    re.DOTALL
+)
+
+ARG_PATTERN = re.compile(r'(\w+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|(\d+)|(\[.*?\]))')
+
+
+def parse_tool_call(text: str) -> list[dict]:
+    calls = []
+    for match in TOOL_PATTERN.finditer(text):
+        name = match.group(1)
+        args_str = match.group(2).strip()
+        args = {}
+        for am in ARG_PATTERN.finditer(args_str):
+            key = am.group(1)
+            val = am.group(2) or am.group(3) or am.group(4) or am.group(5)
+            args[key] = val
+        calls.append({"name": name, "arguments": args})
+    return calls
 
 
 class AgentLoop:
@@ -34,39 +53,64 @@ class AgentLoop:
         self.llm = llm
         self.tools = tools
         self.config = config
-        self.messages: list[Message] = [
-            Message(role=Role.SYSTEM, content=SYSTEM_PROMPT),
-        ]
         self.turn = 0
         self.done = False
+        self.modified_files = []
 
-    def run(self, user_input: str) -> str:
+    def run(self, user_input: str) -> tuple[str, list[dict], list[str]]:
+        system_content = "You are an autonomous coding agent. You solve problems step by step."
+        system_content += TOOL_DESCRIPTIONS
+        system_content += "\n\nThink step by step, then call tools to execute."
+
+        self.messages = [Message(role=Role.SYSTEM, content=system_content)]
         self.messages.append(Message(role=Role.USER, content=user_input))
+        events = []
         summary = ""
 
         while self.turn < self.config.max_turns and not self.done:
             self.turn += 1
 
-            response = self.llm.chat(self.messages, self.tools.get_all_tool_definitions())
+            response = self.llm.chat(self.messages)
             self.messages.append(response)
 
-            if response.content:
-                print(f"\n  Agent: {response.content}")
+            text = response.content or ""
 
-            if response.tool_calls:
-                for tc in response.tool_calls:
+            tool_calls = parse_tool_call(text)
+
+            if tool_calls:
+                think_text = text
+                for tc in tool_calls:
+                    placeholder = f"{tc['name']}({', '.join(f'{k}={v}' for k,v in tc['arguments'].items())})"
+                    think_text = think_text.replace(placeholder, f"[calling {tc['name']}...]", 1)
+                think_text = think_text.strip()
+                if think_text:
+                    events.append({"type": "think", "content": think_text})
+
+                for tc in tool_calls:
                     tool_name = tc["name"]
                     args = tc.get("arguments", {})
 
                     if tool_name == "finish":
                         summary = args.get("summary", "Task completed")
                         self.done = True
-                        print(f"\n  [Finish] {summary}")
+                        events.append({"type": "finish", "content": summary})
                         break
 
-                    print(f"\n  [Tool] {tool_name}({args})")
+                    events.append({"type": "tool", "name": tool_name, "args": dict(args)})
+
                     result = self.tools.execute(tool_name, **args)
-                    print(f"  [Result] {'OK' if result.success else 'FAIL'}: {result.output[:300]}")
+
+                    events.append({
+                        "type": "result",
+                        "success": result.success,
+                        "output": result.output[:500],
+                        "error": result.error,
+                    })
+
+                    if tool_name in ("write_file", "edit_file") and result.success:
+                        file_path = args.get("path", "")
+                        self.modified_files.append(file_path)
+                        events.append({"type": "file", "path": file_path, "action": tool_name})
 
                     tool_msg = Message(
                         role=Role.TOOL,
@@ -83,9 +127,11 @@ class AgentLoop:
                         )
                         self.messages.append(retry_msg)
             else:
+                if text.strip():
+                    events.append({"type": "think", "content": text.strip()})
                 self.done = True
 
         if not self.done and self.turn >= self.config.max_turns:
             summary = "Reached max turns"
 
-        return summary or "Task completed"
+        return summary or "Task completed", events, list(set(self.modified_files))
